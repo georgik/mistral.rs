@@ -10,16 +10,16 @@
 //! - Tests both tool calling format AND client response handling
 
 use axum::{
-    extract::{State, ws::WebSocket},
-    response::{IntoResponse, Json},
+    extract::{State, WebSocketUpgrade},
+    response::{IntoResponse, Json, Html},
     routing::{get, post},
     Router,
 };
+use axum::extract::ws::Message;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
-    time::SystemTime,
 };
 use tokio::sync::broadcast::{channel, Sender};
 use tracing::{error, info};
@@ -250,7 +250,7 @@ async fn wizard_ui() -> impl IntoResponse {
 </html>
     "#;
 
-    axum::Html::html(html).into_response()
+    Html(html)
 }
 
 /// GET /status - Current status for wizards
@@ -274,11 +274,13 @@ async fn respond_to_call(
     responses.insert(call_id.clone(), payload.clone());
 
     // Notify about response ready
-    let _ = state.broadcast_tx.send(serde_json::to_string(&serde_json::json!({
+    if let Ok(msg) = serde_json::to_string(&serde_json::json!({
         "type": "response_ready",
         "call_id": call_id,
         "response": payload
-    })));
+    })) {
+        let _ = state.broadcast_tx.send(msg);
+    }
 
     Json(serde_json::json!({
         "status": "queued",
@@ -291,66 +293,56 @@ async fn wizard_websocket(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(|socket| async move {
-        let mut socket = socket;
-        let mut rx = state.broadcast_tx.subscribe();
+    ws.on_upgrade(|mut socket| async move {
+        let rx = state.broadcast_tx.subscribe();
 
         // Send connection confirmation
-        let _ = socket.send(axum::extract::ws::Message::Text(
-            serde_json::to_string(&serde_json::json!({
-                "type": "connected",
-                "message": "Connected to Wizard of Oz dispatch server"
-            }))
-        ).into());
+        if let Ok(msg) = serde_json::to_string(&serde_json::json!({
+            "type": "connected",
+            "message": "Connected to Wizard of Oz dispatch server"
+        })) {
+            let _ = socket.send(Message::Text(msg.into())).await;
+        }
 
         // Handle incoming messages from wizard
         let mut rx2 = rx.resubscribe();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    result = socket.recv() => {
-                        match result {
-                            Some(Ok(msg)) => {
-                                if let axum::extract::ws::Message::Text(text) = msg {
-                                    if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
-                                        if let Some(msg_type) = data.get("type").and_then(|v| v.as_str()) {
-                                            match msg_type {
-                                                "ping" => {
-                                                    let _ = socket.send(axum::extract::ws::Message::Text(
-                                                        serde_json::to_string(&serde_json::json!({
-                                                            "type": "pong"
-                                                        }))
-                                                    ).into());
-                                                }
-                                                _ => {}
+        loop {
+            tokio::select! {
+                result = socket.recv() => {
+                    match result {
+                        Some(Ok(msg)) => {
+                            if let Message::Text(text) = msg {
+                                if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
+                                    if let Some(msg_type) = data.get("type").and_then(|v| v.as_str()) {
+                                        if msg_type == "ping" {
+                                            if let Ok(pong) = serde_json::to_string(&serde_json::json!({"type": "pong"})) {
+                                                let _ = socket.send(Message::Text(pong.into())).await;
                                             }
                                         }
                                     }
                                 }
                             }
-                            Some(Err(e)) => {
-                                error!("WebSocket error: {}", e);
-                                break;
-                            }
-                            None => break,
                         }
+                        Some(Err(e)) => {
+                            error!("WebSocket error: {}", e);
+                            break;
+                        }
+                        None => break,
                     }
-                    result = rx2.recv() => {
-                        match result {
-                            Ok(msg) => {
-                                let _ = socket.send(axum::extract::ws::Message::Text(msg)).into();
-                            }
-                            Err(e) => {
-                                error!("Broadcast error: {}", e);
-                                break;
-                            }
+                }
+                result = rx2.recv() => {
+                    match result {
+                        Ok(msg) => {
+                            let _ = socket.send(Message::Text(msg.into())).await;
+                        }
+                        Err(e) => {
+                            error!("Broadcast error: {}", e);
+                            break;
                         }
                     }
                 }
             }
-        });
-
-        Ok(())
+        }
     })
 }
 
@@ -368,10 +360,12 @@ async fn dispatch_tool(
     }
 
     // Broadcast to wizard UI
-    let _ = state.broadcast_tx.send(serde_json::to_string(&serde_json::json!({
+    if let Ok(msg) = serde_json::to_string(&serde_json::json!({
         "type": "tool_call",
         "call": tool_call
-    })));
+    })) {
+        let _ = state.broadcast_tx.send(msg);
+    }
 
     // Wait for wizard to respond (polling endpoint)
     // In real implementation, this would use async channel
@@ -394,36 +388,51 @@ async fn poll_response(
     if let Some(response) = responses.get(&call_id) {
         info!("Returning response for call {}", call_id);
 
-        // Remove from pending
-        let mut calls = state.pending_calls.lock().unwrap();
-        calls.retain(|c| c.id != call_id);
-
-        // Clean up old responses
-        responses.remove(&call_id);
-
-        // Broadcast completion
-        let _ = state.broadcast_tx.send(serde_json::to_string(&serde_json::json!({
-            "type": "response_complete",
-            "call_id": call_id,
-            "response": response.result
-        })));
-
         // Return the result
         let result = if response.use_model {
             // Special case: let model handle it
-            "{\"use_model\": true}"
+            "{\"use_model\": true}".to_string()
         } else {
-            &response.result
+            response.result.clone()
         };
 
+        // Clone response for broadcast
+        let response_clone = response.clone();
+
+        // Release lock before cleanup
+        drop(responses);
+
+        // Remove from pending
+        {
+            let mut calls = state.pending_calls.lock().unwrap();
+            calls.retain(|c| c.id != call_id);
+        }
+
+        // Clean up response
+        {
+            let mut responses = state.responses.lock().unwrap();
+            responses.remove(&call_id);
+        }
+
+        // Broadcast completion
+        if let Ok(msg) = serde_json::to_string(&serde_json::json!({
+            "type": "response_complete",
+            "call_id": call_id,
+            "response": response_clone.result
+        })) {
+            let _ = state.broadcast_tx.send(msg);
+        }
+
         // Return in format expected by mistral.rs tool dispatch
-        (axum::http::StatusCode::OK, result.clone())
+        (axum::http::StatusCode::OK, result)
     } else {
         // Still waiting
-        (axum::http::StatusCode::ACCEPTED, serde_json::json!({
+        drop(responses);
+        let waiting = serde_json::json!({
             "status": "waiting",
             "message": "Waiting for wizard response"
-        }))
+        });
+        (axum::http::StatusCode::ACCEPTED, waiting.to_string())
     }
 }
 
@@ -436,7 +445,7 @@ pub fn create_wizard_router() -> Router {
         .route("/status", get(get_status))
         .route("/dispatch", post(dispatch_tool))
         .route("/respond", post(respond_to_call))
-        .route("/poll/:call_id", get(poll_response))
+        .route("/poll/{call_id}", get(poll_response))
         .route("/ws", get(wizard_websocket))
         .with_state(state)
 }
