@@ -43,6 +43,17 @@ pub struct ServerOptions {
     #[arg(long)]
     #[serde(default)]
     pub tool_dispatch_url: Option<String>,
+
+    /// Enable Wizard of Oz mode for tool testing
+    /// Spawns a separate HTTP server on port 7890 where human wizards can respond to tool calls
+    #[arg(long)]
+    #[serde(default)]
+    pub wizard_mode: bool,
+
+    /// Wizard of Oz server port (default: 7890)
+    #[arg(long, default_value_t = 7890)]
+    #[serde(default = "default_wizard_port")]
+    pub wizard_port: u16,
 }
 
 impl Default for ServerOptions {
@@ -55,6 +66,8 @@ impl Default for ServerOptions {
             ui: false,
             max_tool_rounds: None,
             tool_dispatch_url: None,
+            wizard_mode: false,
+            wizard_port: 7890,
         }
     }
 }
@@ -65,4 +78,8 @@ fn default_port() -> u16 {
 
 fn default_host() -> String {
     "0.0.0.0".to_string()
+}
+
+fn default_wizard_port() -> u16 {
+    7890
 }

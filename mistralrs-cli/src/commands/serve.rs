@@ -9,6 +9,7 @@ use mistralrs_core::{
 use mistralrs_server_core::{
     mistralrs_for_server_builder::MistralRsForServerBuilder,
     mistralrs_server_router_builder::MistralRsServerRouterBuilder,
+    wizard_ofoz::create_wizard_router,
 };
 
 use crate::args::{
@@ -85,11 +86,18 @@ pub async fn run_server(
     let mistralrs = builder.build().await?;
     let mistralrs_for_ui = mistralrs.clone();
 
+    // Set tool dispatch URL to wizard server if wizard mode is enabled
+    let tool_dispatch_url = if server.wizard_mode {
+        Some(format!("http://localhost:{}/dispatch", server.wizard_port))
+    } else {
+        server.tool_dispatch_url.clone()
+    };
+
     // Build and run the server
     let mut app = MistralRsServerRouterBuilder::new()
         .with_mistralrs(mistralrs)
         .with_max_tool_rounds_optional(server.max_tool_rounds)
-        .with_tool_dispatch_url_optional(server.tool_dispatch_url.clone())
+        .with_tool_dispatch_url_optional(tool_dispatch_url)
         .build()
         .await?;
 
@@ -108,6 +116,31 @@ pub async fn run_server(
         tokio::net::TcpListener::bind(format!("{}:{}", server.host, server.port)).await?;
 
     info!("Server listening on http://{}:{}", server.host, server.port);
+
+    // Spawn wizard server if enabled
+    if server.wizard_mode {
+        let wizard_port = server.wizard_port;
+        let wizard_router = create_wizard_router();
+        let wizard_listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", wizard_port))
+            .await
+            .context("Failed to bind wizard server port")?;
+
+        info!(
+            "Wizard of Oz server listening on http://0.0.0.0:{}",
+            wizard_port
+        );
+        info!("Open this URL in your browser to start dispatching tools");
+
+        // Spawn wizard server in background
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(wizard_listener, wizard_router).await {
+                tracing::error!("Wizard server error: {}", e);
+            }
+        });
+
+        // Update tool dispatch URL to point to wizard server
+        info!("Tool dispatch URL set to wizard server at http://localhost:{}/dispatch", wizard_port);
+    }
 
     axum::serve(listener, app).await?;
 

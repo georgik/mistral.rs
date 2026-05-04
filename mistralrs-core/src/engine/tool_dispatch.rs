@@ -21,7 +21,7 @@ use crate::{
 use super::Engine;
 
 /// The result of executing a tool call.
-pub(super) struct ToolResult {
+pub struct ToolResult {
     pub content: String,
 }
 

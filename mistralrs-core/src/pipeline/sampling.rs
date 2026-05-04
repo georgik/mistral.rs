@@ -172,7 +172,14 @@ pub(crate) async fn finish_or_add_toks_to_seq(
                         }
                     } else {
                         // Not in Harmony mode - parse text for tool calls
-                        let (_, tool_calls) = parse_text_tools(delta.as_str(), seq.tools.clone())
+                        // When reasoning_mode is active, parse from content_delta (not raw delta)
+                        // to avoid parsing tool calls from reasoning tokens
+                        let tool_source = if seq.reasoning_mode().is_some() {
+                            content_delta.as_deref().unwrap_or("")
+                        } else {
+                            delta.as_str()
+                        };
+                        let (_, tool_calls) = parse_text_tools(tool_source, seq.tools.clone())
                             .map_err(candle_core::Error::msg)?;
                         if !tool_calls.is_empty() {
                             is_done = Some(StopReason::ToolCalls);
