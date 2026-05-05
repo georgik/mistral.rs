@@ -25,6 +25,7 @@ Fast, flexible LLM inference.
 
 ## Latest
 
+- **Wizard of Oz testing**: Interactive debugging interface for tool workflows with real-time monitoring and delegation support. [Documentation](WIZARD_OF_OZ.md)
 - **Gemma 4**: Full multimodal: text, image, video, and audio input. [Guide](https://ericlbuehler.github.io/mistral.rs/GEMMA4.html) | [Video setup](https://ericlbuehler.github.io/mistral.rs/VIDEO.html)
 - **MXFP4 ISQ quantization**: MXFP4 with optimized decode kernels for faster, smaller models. [Quantization docs](https://ericlbuehler.github.io/mistral.rs/QUANTS.html)
 - **Qwen 3.5 model family**: Support for the Qwen 3.5 series including vision. [Guide](https://ericlbuehler.github.io/mistral.rs/QWEN3_5.html)
@@ -123,6 +124,7 @@ mistralrs doctor
 - Integrated [tool calling](https://ericlbuehler.github.io/mistral.rs/TOOL_CALLING.html) with grammar enforcement and strict schema mode
 - ⭐ Server-side [agentic loop](https://ericlbuehler.github.io/mistral.rs/TOOL_CALLING.html#agentic-loop): auto-execute tools and feed results back
 - ⭐ [Tool dispatch URL](https://ericlbuehler.github.io/mistral.rs/TOOL_CALLING.html#tool-dispatch-url): POST tool calls to your own endpoint
+- ⭐ [Wizard of Oz testing](WIZARD_OF_OZ.md): Interactive debugging interface for tool workflows with real-time monitoring
 - ⭐ [Web search integration](https://ericlbuehler.github.io/mistral.rs/WEB_SEARCH.html) with embedding-based ranking
 - ⭐ [MCP client](https://ericlbuehler.github.io/mistral.rs/MCP/client.html): Connect to external tools via Process, HTTP, or WebSocket
 - Python/Rust [tool callbacks](https://ericlbuehler.github.io/mistral.rs/TOOL_CALLING.html#tool-callbacks) for custom execution

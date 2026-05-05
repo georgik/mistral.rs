@@ -14,8 +14,9 @@ homepage.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-axum = { workspace = true, features = ["tokio"] }
+axum = { workspace = true, features = ["tokio", "ws"] }
 candle-core.workspace = true
+chrono.workspace = true
 data-url.workspace = true
 either.workspace = true
 futures.workspace = true
@@ -52,3 +53,6 @@ accelerate = ["mistralrs-core/accelerate"]
 mkl = ["mistralrs-core/mkl"]
 nccl = ["mistralrs-core/nccl"]
 ring = ["mistralrs-core/ring"]
+
+[dev-dependencies]
+reqwest = { workspace = true, features = ["json"] }

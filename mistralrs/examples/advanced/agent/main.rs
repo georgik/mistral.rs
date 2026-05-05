@@ -93,7 +93,7 @@ async fn web_search(
 async fn main() -> Result<()> {
     // Build the model
     // Using a model that supports tool calling (e.g., Llama 3.1, Qwen, Mistral)
-    let model = ModelBuilder::new("Qwen/Qwen3-4B")
+    let model = ModelBuilder::new("Qwen3-1.7B")
         .with_auto_isq(IsqBits::Four)
         .with_logging()
         .with_paged_attn(PagedAttentionMetaBuilder::default().build()?)

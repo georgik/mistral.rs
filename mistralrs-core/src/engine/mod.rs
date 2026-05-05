@@ -357,8 +357,15 @@ impl Engine {
             }
 
             let run_start = Instant::now();
+
+            // Get max sequence length from pipeline for context tracking
+            let max_seq_len = {
+                let pipeline = get_mut_arcmutex!(self.pipeline);
+                pipeline.get_metadata().max_seq_len
+            };
+
             let mut scheduler = get_mut_arcmutex!(self.scheduler);
-            let scheduled = scheduler.schedule(&self.logger);
+            let scheduled = scheduler.schedule(&self.logger, max_seq_len);
 
             match scheduled {
                 SchedulerOutput::DefaultScheduler {

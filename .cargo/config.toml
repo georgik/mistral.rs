@@ -1,4 +1,5 @@
 [build]
+incremental = true
 rustflags = ["-C", "target-cpu=native"]
 
 [target.aarch64-apple-darwin]

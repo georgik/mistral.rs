@@ -10,6 +10,8 @@ use crate::{
     ToolCallResponse, ToolChoice, WebSearchOptions,
 };
 
+use super::tool_dispatch::ToolResult;
+
 use super::Engine;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -163,8 +165,98 @@ fn do_http_tool(mut request: NormalRequest, tc: &ToolCallResponse, url: &str) ->
     append_assistant_tool_call(messages, tc);
 
     let result = tool_dispatch::execute_http_tool(tc, url);
+
+    // Check for complete marker (WOZ "Skip AI" mode)
+    if result.content.starts_with("__COMPLETE__:") {
+        let final_response = result.content.replacen("__COMPLETE__:", "", 1);
+        tracing::info!("Tool {} returned complete marker, stopping agentic loop", tc.function.name);
+
+        // Append tool response and stop the loop
+        append_tool_response(messages, &tc.function.name, final_response.clone());
+
+        // Return with tool_choice = None to stop further tool calls
+        request.tool_choice = None;
+        return request;
+    }
+
+    // Check for delegate marker (WOZ "Delegate to Agent" mode)
+    if result.content.starts_with("__DELEGATE__") {
+        tracing::info!("Tool {} delegated to client - keeping tool call in response for agent to execute", tc.function.name);
+        tracing::info!("Agent should see: finish_reason='tool_calls' with tool_calls array in response");
+
+        // DON'T remove the assistant tool call message!
+        // Let the response go back with tool_calls intact
+        // The client (Goose) will execute the tool and send back a tool role message
+        request.tool_choice = None;
+        return request;
+    }
+
     append_tool_response(messages, &tc.function.name, result.content);
 
+    request.tool_choice = Some(ToolChoice::Auto);
+    request
+}
+
+fn do_wizard_tool(mut request: NormalRequest, tc: &ToolCallResponse) -> NormalRequest {
+    use std::path::PathBuf;
+
+    let messages = get_messages_mut(&mut request);
+    append_assistant_tool_call(messages, tc);
+
+    // Wizard mode: load response from file
+    let result = if let Ok(base_dir) = std::env::var("MISTRALRS_WIZARD_DIR") {
+        let base_dir = PathBuf::from(base_dir);
+        let responses_file = base_dir.join("wizard_responses.jsonl");
+
+        // Try to find a response for this tool call
+        let mut found_result = None;
+        if let Ok(file) = std::fs::File::open(&responses_file) {
+            use std::io::BufRead;
+            let reader = std::io::BufReader::new(file);
+
+            for line in reader.lines().filter_map(|l| l.ok()) {
+                if let Ok(resp) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if resp.get("id").and_then(|v| v.as_str()) == Some(&tc.id) {
+                        if let Some(result) = resp.get("result").and_then(|v| v.as_str()) {
+                            tracing::info!("Wizard of Oz: Returning pre-defined response for tool call {}", tc.id);
+                            found_result = Some(ToolResult { content: result.to_string() });
+                            break;
+                        } else {
+                            tracing::warn!("Wizard of Oz: Invalid response format for call {}", tc.id);
+                            found_result = Some(ToolResult {
+                                content: format!("Wizard of Oz: Invalid response format in {} for call {}",
+                                    responses_file.display(), tc.id)
+                            });
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(result) = found_result {
+            result
+        } else {
+            // No pre-defined response found
+            tracing::info!("Wizard of Oz: No pre-defined response for tool call {}", tc.id);
+            ToolResult {
+                content: format!(
+                    "Wizard of Oz: Tool {} called with args {}. No pre-defined response available.\nAdd a response to {} with format: {{\"id\": \"{}\", \"result\": \"your response here\"}}",
+                    tc.function.name,
+                    tc.function.arguments,
+                    responses_file.display(),
+                    tc.id
+                )
+            }
+        }
+    } else {
+        tracing::error!("Wizard of Oz: MISTRALRS_WIZARD_DIR not set");
+        ToolResult {
+            content: "Wizard of Oz: Error - MISTRALRS_WIZARD_DIR environment variable not set".to_string()
+        }
+    };
+
+    append_tool_response(messages, &tc.function.name, result.content);
     request.tool_choice = Some(ToolChoice::Auto);
     request
 }
@@ -270,6 +362,8 @@ pub(super) async fn search_request(this: Arc<Engine>, request: NormalRequest) {
                                 calls.len()
                             );
                         }
+                        tracing::info!("Tool call in response: {} with args {}",
+                            calls[0].function.name, calls[0].function.arguments);
                         Some(&calls[0])
                     }
                     _ => None,
@@ -277,6 +371,11 @@ pub(super) async fn search_request(this: Arc<Engine>, request: NormalRequest) {
 
                 // No tool call, or max rounds reached? We are finished.
                 if tc_opt.is_none() || round >= max_rounds {
+                    tracing::info!("No tool call or max rounds reached, sending Done response to client");
+                    tracing::info!("Done response finish_reason: {}, tool_calls: {:?}",
+                        done.choices[0].finish_reason,
+                        done.choices[0].message.tool_calls
+                    );
                     user_sender
                         .send(Response::Done(done.clone()))
                         .await
@@ -299,7 +398,41 @@ pub(super) async fn search_request(this: Arc<Engine>, request: NormalRequest) {
                 } else if this_clone.tool_callbacks.contains_key(&tc.function.name) {
                     do_custom_tool(this_clone.clone(), visible_req, tc).await
                 } else if let Some(ref url) = dispatch_url {
-                    do_http_tool(visible_req, tc, url)
+                    // Check if this is wizard mode
+                    if url == "wizard" || url.starts_with("wizard:") {
+                        do_wizard_tool(visible_req, tc)
+                    } else {
+                        let result_req = do_http_tool(visible_req, tc, url);
+
+                        // Check if delegation occurred
+                        if result_req.tool_choice.is_none() {
+                            let woz_url = format!("{}/log_delegation", url.trim_end_matches("/dispatch"));
+                            let tool_name = tc.function.name.clone();
+                            let tool_args = tc.function.arguments.clone();
+                            tokio::spawn(async move {
+                                tracing::info!("Logging tool delegation to WOZ: {}", tool_name);
+                                let _ = reqwest::Client::new()
+                                    .post(&woz_url)
+                                    .json(&serde_json::json!({
+                                        "tool_name": tool_name,
+                                        "tool_args": tool_args,
+                                        "action": "delegated_to_client"
+                                    }))
+                                    .send()
+                                    .await;
+                            });
+
+                            // Send response with tool_calls back to client and stop
+                            tracing::info!("Delegation detected, sending tool_calls response to client");
+                            user_sender
+                                .send(Response::Done(done.clone()))
+                                .await
+                                .unwrap();
+                            return;
+                        }
+
+                        result_req
+                    }
                 } else {
                     // No way to execute — return to client.
                     user_sender
@@ -320,6 +453,7 @@ pub(super) async fn search_request(this: Arc<Engine>, request: NormalRequest) {
             else {
                 // We need the *last* chunk to see whether a tool was called.
                 let mut last_choice = None;
+                let mut has_tool_call = false;
 
                 while let Some(resp) = receiver.recv().await {
                     let Some(resp) = forward_passthrough(resp, &user_sender).await else {
@@ -327,14 +461,17 @@ pub(super) async fn search_request(this: Arc<Engine>, request: NormalRequest) {
                     };
                     match resp {
                         Response::Chunk(chunk) => {
-                            // Forward content-bearing chunks, suppress tool-call chunks.
-                            // Forwarding tool call chunks would cause streaming clients
-                            // to see a premature finish_reason before the tool loop
-                            // has a chance to execute the tool and continue.
                             let first_choice = &chunk.choices[0];
-                            if first_choice.delta.tool_calls.is_none() {
-                                let _ = user_sender.send(Response::Chunk(chunk.clone())).await;
+
+                            // Track if any chunk has a tool call
+                            if first_choice.delta.tool_calls.is_some() {
+                                has_tool_call = true;
                             }
+
+                            // Always forward content chunks
+                            // Forward tool-call chunks too - needed for client-side execution
+                            let _ = user_sender.send(Response::Chunk(chunk.clone())).await;
+
                             last_choice = Some(first_choice.clone());
 
                             if last_choice
@@ -385,7 +522,37 @@ pub(super) async fn search_request(this: Arc<Engine>, request: NormalRequest) {
                 } else if this_clone.tool_callbacks.contains_key(&tc.function.name) {
                     do_custom_tool(this_clone.clone(), visible_req, tc).await
                 } else if let Some(ref url) = dispatch_url {
-                    do_http_tool(visible_req, tc, url)
+                    // Check if this is wizard mode
+                    if url == "wizard" || url.starts_with("wizard:") {
+                        do_wizard_tool(visible_req, tc)
+                    } else {
+                        let result_req = do_http_tool(visible_req, tc, url);
+
+                        // Check if delegation occurred
+                        if result_req.tool_choice.is_none() {
+                            let woz_url = format!("{}/log_delegation", url.trim_end_matches("/dispatch"));
+                            let tool_name = tc.function.name.clone();
+                            let tool_args = tc.function.arguments.clone();
+                            tokio::spawn(async move {
+                                tracing::info!("Logging tool delegation to WOZ (streaming): {}", tool_name);
+                                let _ = reqwest::Client::new()
+                                    .post(&woz_url)
+                                    .json(&serde_json::json!({
+                                        "tool_name": tool_name,
+                                        "tool_args": tool_args,
+                                        "action": "delegated_to_client"
+                                    }))
+                                    .send()
+                                    .await;
+                            });
+
+                            // Send response with tool_calls back to client and stop
+                            tracing::info!("Delegation detected (streaming), sending tool_calls response to client");
+                            break;
+                        }
+
+                        result_req
+                    }
                 } else {
                     break; // No way to execute — client handles it.
                 };
