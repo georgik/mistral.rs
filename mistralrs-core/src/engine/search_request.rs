@@ -165,6 +165,20 @@ fn do_http_tool(mut request: NormalRequest, tc: &ToolCallResponse, url: &str) ->
     append_assistant_tool_call(messages, tc);
 
     let result = tool_dispatch::execute_http_tool(tc, url);
+
+    // Check for complete marker (WOZ "Skip AI" mode)
+    if result.content.starts_with("__COMPLETE__:") {
+        let final_response = result.content.replacen("__COMPLETE__:", "", 1);
+        tracing::info!("Tool {} returned complete marker, stopping agentic loop", tc.function.name);
+
+        // Append tool response and stop the loop
+        append_tool_response(messages, &tc.function.name, final_response.clone());
+
+        // Return with tool_choice = None to stop further tool calls
+        request.tool_choice = None;
+        return request;
+    }
+
     append_tool_response(messages, &tc.function.name, result.content);
 
     request.tool_choice = Some(ToolChoice::Auto);
