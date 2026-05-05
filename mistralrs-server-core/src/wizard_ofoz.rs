@@ -126,7 +126,8 @@ async fn wizard_ui() -> impl IntoResponse {
         let currentCall = null;
 
         function connect() {
-            ws = new WebSocket('ws://localhost:7890/ws');
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
 
             ws.onopen = () => addLog('Connected to Wizard server', 'info');
             ws.onmessage = (event) => {
