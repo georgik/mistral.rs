@@ -53,6 +53,8 @@ pub trait Processor {
         //     }
         // }
 
+        // Debug: check if tools before they're moved
+        let has_tools = !tools.is_empty();
         let prompt = apply_chat_template(
             pipeline,
             messages,
@@ -62,6 +64,11 @@ pub trait Processor {
             self.template_action(),
             tools,
         )?;
+
+        if has_tools {
+            tracing::info!("=== PROMPT WITH TOOLS ===\n{}\n=== END PROMPT ===", prompt);
+        }
+
         let encoding = pipeline
             .tokenizer()
             .with_context(|| {

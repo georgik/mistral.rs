@@ -179,6 +179,18 @@ fn do_http_tool(mut request: NormalRequest, tc: &ToolCallResponse, url: &str) ->
         return request;
     }
 
+    // Check for delegate marker (WOZ "Delegate to Agent" mode)
+    if result.content.starts_with("__DELEGATE__") {
+        tracing::info!("Tool {} delegated to client - keeping tool call in response for agent to execute", tc.function.name);
+        tracing::info!("Agent should see: finish_reason='tool_calls' with tool_calls array in response");
+
+        // DON'T remove the assistant tool call message!
+        // Let the response go back with tool_calls intact
+        // The client (Goose) will execute the tool and send back a tool role message
+        request.tool_choice = None;
+        return request;
+    }
+
     append_tool_response(messages, &tc.function.name, result.content);
 
     request.tool_choice = Some(ToolChoice::Auto);
@@ -350,6 +362,8 @@ pub(super) async fn search_request(this: Arc<Engine>, request: NormalRequest) {
                                 calls.len()
                             );
                         }
+                        tracing::info!("Tool call in response: {} with args {}",
+                            calls[0].function.name, calls[0].function.arguments);
                         Some(&calls[0])
                     }
                     _ => None,
@@ -357,6 +371,11 @@ pub(super) async fn search_request(this: Arc<Engine>, request: NormalRequest) {
 
                 // No tool call, or max rounds reached? We are finished.
                 if tc_opt.is_none() || round >= max_rounds {
+                    tracing::info!("No tool call or max rounds reached, sending Done response to client");
+                    tracing::info!("Done response finish_reason: {}, tool_calls: {:?}",
+                        done.choices[0].finish_reason,
+                        done.choices[0].message.tool_calls
+                    );
                     user_sender
                         .send(Response::Done(done.clone()))
                         .await
@@ -383,7 +402,36 @@ pub(super) async fn search_request(this: Arc<Engine>, request: NormalRequest) {
                     if url == "wizard" || url.starts_with("wizard:") {
                         do_wizard_tool(visible_req, tc)
                     } else {
-                        do_http_tool(visible_req, tc, url)
+                        let result_req = do_http_tool(visible_req, tc, url);
+
+                        // Check if delegation occurred
+                        if result_req.tool_choice.is_none() {
+                            let woz_url = format!("{}/log_delegation", url.trim_end_matches("/dispatch"));
+                            let tool_name = tc.function.name.clone();
+                            let tool_args = tc.function.arguments.clone();
+                            tokio::spawn(async move {
+                                tracing::info!("Logging tool delegation to WOZ: {}", tool_name);
+                                let _ = reqwest::Client::new()
+                                    .post(&woz_url)
+                                    .json(&serde_json::json!({
+                                        "tool_name": tool_name,
+                                        "tool_args": tool_args,
+                                        "action": "delegated_to_client"
+                                    }))
+                                    .send()
+                                    .await;
+                            });
+
+                            // Send response with tool_calls back to client and stop
+                            tracing::info!("Delegation detected, sending tool_calls response to client");
+                            user_sender
+                                .send(Response::Done(done.clone()))
+                                .await
+                                .unwrap();
+                            return;
+                        }
+
+                        result_req
                     }
                 } else {
                     // No way to execute — return to client.
@@ -405,6 +453,7 @@ pub(super) async fn search_request(this: Arc<Engine>, request: NormalRequest) {
             else {
                 // We need the *last* chunk to see whether a tool was called.
                 let mut last_choice = None;
+                let mut has_tool_call = false;
 
                 while let Some(resp) = receiver.recv().await {
                     let Some(resp) = forward_passthrough(resp, &user_sender).await else {
@@ -412,14 +461,17 @@ pub(super) async fn search_request(this: Arc<Engine>, request: NormalRequest) {
                     };
                     match resp {
                         Response::Chunk(chunk) => {
-                            // Forward content-bearing chunks, suppress tool-call chunks.
-                            // Forwarding tool call chunks would cause streaming clients
-                            // to see a premature finish_reason before the tool loop
-                            // has a chance to execute the tool and continue.
                             let first_choice = &chunk.choices[0];
-                            if first_choice.delta.tool_calls.is_none() {
-                                let _ = user_sender.send(Response::Chunk(chunk.clone())).await;
+
+                            // Track if any chunk has a tool call
+                            if first_choice.delta.tool_calls.is_some() {
+                                has_tool_call = true;
                             }
+
+                            // Always forward content chunks
+                            // Forward tool-call chunks too - needed for client-side execution
+                            let _ = user_sender.send(Response::Chunk(chunk.clone())).await;
+
                             last_choice = Some(first_choice.clone());
 
                             if last_choice
@@ -474,7 +526,32 @@ pub(super) async fn search_request(this: Arc<Engine>, request: NormalRequest) {
                     if url == "wizard" || url.starts_with("wizard:") {
                         do_wizard_tool(visible_req, tc)
                     } else {
-                        do_http_tool(visible_req, tc, url)
+                        let result_req = do_http_tool(visible_req, tc, url);
+
+                        // Check if delegation occurred
+                        if result_req.tool_choice.is_none() {
+                            let woz_url = format!("{}/log_delegation", url.trim_end_matches("/dispatch"));
+                            let tool_name = tc.function.name.clone();
+                            let tool_args = tc.function.arguments.clone();
+                            tokio::spawn(async move {
+                                tracing::info!("Logging tool delegation to WOZ (streaming): {}", tool_name);
+                                let _ = reqwest::Client::new()
+                                    .post(&woz_url)
+                                    .json(&serde_json::json!({
+                                        "tool_name": tool_name,
+                                        "tool_args": tool_args,
+                                        "action": "delegated_to_client"
+                                    }))
+                                    .send()
+                                    .await;
+                            });
+
+                            // Send response with tool_calls back to client and stop
+                            tracing::info!("Delegation detected (streaming), sending tool_calls response to client");
+                            break;
+                        }
+
+                        result_req
                     }
                 } else {
                     break; // No way to execute — client handles it.

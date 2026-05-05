@@ -683,6 +683,51 @@ pub async fn chatcompletions(
         Some(oairequest.model.clone())
     };
 
+    // Log request to Wizard of Oz server if available
+    if let Some(ref dispatch_url) = agentic_defaults.tool_dispatch_url {
+        // Extract user message for logging (handle both Vec<Message> and String)
+        let user_message = match &oairequest.messages {
+            either::Either::Left(msgs) => msgs
+                .iter()
+                .filter(|m| m.role == "user")
+                .last()
+                .and_then(|m| m.content.as_ref())
+                .map(|c| serde_json::to_string(c).unwrap_or_else(|_| "[complex content]".to_string()))
+                .unwrap_or_else(|| "[no content]".to_string()),
+            either::Either::Right(s) => s.clone(),
+        };
+
+        let tool_count = oairequest.tools.as_ref().map(|t| t.len()).unwrap_or(0);
+        let model_name = oairequest.model.clone();
+
+        // Spawn background task to log to WOZ (don't block request)
+        let woz_url = format!("{}/log_request", dispatch_url.trim_end_matches("/dispatch"));
+        tracing::info!("Logging request to WOZ: {} (model: {})", woz_url, model_name);
+
+        tokio::spawn(async move {
+            match reqwest::Client::new()
+                .post(&woz_url)
+                .json(&serde_json::json!({
+                    "model": model_name,
+                    "user_message": user_message,
+                    "tool_count": tool_count
+                }))
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    tracing::info!("WOZ request logging successful: {}", resp.status());
+                }
+                Err(e) => {
+                    tracing::error!("WOZ request logging failed: {}", e);
+                }
+            }
+        });
+    }
+
+    // Clone dispatch URL for logging before parse_request consumes it
+    let dispatch_url_for_logging = agentic_defaults.tool_dispatch_url.clone();
+
     // tool_dispatch_url is server-level only (not settable per-request via HTTP API) for security
     let (request, is_streaming) = match parse_request(
         oairequest,
@@ -701,9 +746,96 @@ pub async fn chatcompletions(
     }
 
     if is_streaming {
-        ChatCompletionResponder::Sse(create_streamer(rx, state, None, None))
+        // Create on_done callback to log streaming responses to WOZ
+        let dispatch_url_for_logging_stream = dispatch_url_for_logging.clone();
+        let on_done_callback: ChatCompletionOnDoneCallback = Box::new(move |chunks: &[ChatCompletionChunkResponse]| {
+            if let Some(dispatch_url) = &dispatch_url_for_logging_stream {
+                if let Some(last_chunk) = chunks.last() {
+                    let model_name = last_chunk.model.clone();
+                    let content = chunks.iter()
+                        .filter_map(|c| c.choices.first())
+                        .filter_map(|c| c.delta.content.as_ref())
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .concat();
+                    let finish_reason = last_chunk.choices.first()
+                        .and_then(|c| c.finish_reason.as_ref())
+                        .map(|r| r.to_string())
+                        .unwrap_or_default();
+
+                    let content_preview = if content.len() > 100 { format!("{}...", &content[..100]) } else { content.clone() };
+                    let dispatch_url_clone = dispatch_url.clone();
+
+                    tokio::spawn(async move {
+                        let woz_url = format!("{}/log_response", dispatch_url_clone.trim_end_matches("/dispatch"));
+
+                        tracing::info!("Logging streaming response to WOZ: {} (model: {}, reason: {}, content: {})",
+                            woz_url, model_name, finish_reason, content_preview);
+
+                        match reqwest::Client::new()
+                            .post(&woz_url)
+                            .json(&serde_json::json!({
+                                "model": model_name,
+                                "content": content,
+                                "finish_reason": finish_reason
+                            }))
+                            .send()
+                            .await
+                        {
+                            Ok(resp) => {
+                                tracing::info!("WOZ streaming response logging successful: {}", resp.status());
+                            }
+                            Err(e) => {
+                                tracing::error!("WOZ streaming response logging failed: {}", e);
+                            }
+                        }
+                    });
+                }
+            }
+        });
+
+        ChatCompletionResponder::Sse(create_streamer(rx, state, None, Some(on_done_callback)))
     } else {
-        process_non_streaming_response(&mut rx, state).await
+        let result = process_non_streaming_response(&mut rx, state).await;
+
+        // Log response to Wizard of Oz server if available
+        if let (Some(dispatch_url), ChatCompletionResponder::Json(response)) = (&dispatch_url_for_logging, &result) {
+            let model_name = response.model.clone();
+            let content = response.choices.first()
+                .and_then(|c| c.message.content.as_ref())
+                .unwrap_or(&String::new())
+                .clone();
+            let finish_reason = response.choices.first()
+                .map(|c| c.finish_reason.to_string())
+                .unwrap_or_default();
+
+            let woz_url = format!("{}/log_response", dispatch_url.trim_end_matches("/dispatch"));
+            let content_preview = if content.len() > 100 { &content[..100] } else { &content };
+            tracing::info!("Logging response to WOZ: {} (model: {}, reason: {}, content: {})",
+                woz_url, model_name, finish_reason, content_preview);
+
+            tokio::spawn(async move {
+                match reqwest::Client::new()
+                    .post(&woz_url)
+                    .json(&serde_json::json!({
+                        "model": model_name,
+                        "content": content,
+                        "finish_reason": finish_reason
+                    }))
+                    .send()
+                    .await
+                {
+                    Ok(resp) => {
+                        tracing::info!("WOZ response logging successful: {}", resp.status());
+                    }
+                    Err(e) => {
+                        tracing::error!("WOZ response logging failed: {}", e);
+                    }
+                }
+            });
+        }
+
+        result
     }
 }
 

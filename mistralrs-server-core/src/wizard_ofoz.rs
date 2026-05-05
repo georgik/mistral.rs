@@ -50,6 +50,25 @@ struct ToolResponse {
 struct WizardStatus {
     pending_calls: Vec<ToolCallRequest>,
     active_sessions: usize,
+    recent_requests: Vec<IncomingRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IncomingRequest {
+    id: String,
+    model: String,
+    user_message: String,
+    tool_count: usize,
+    timestamp: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ModelResponse {
+    id: String,
+    model: String,
+    content: String,
+    finish_reason: String,
+    timestamp: String,
 }
 
 struct AppState {
@@ -57,6 +76,8 @@ struct AppState {
     responses: Mutex<HashMap<String, ToolResponse>>,
     response_waiters: Mutex<HashMap<String, tokio::sync::oneshot::Sender<ToolResponse>>>,
     broadcast_tx: Sender<String>,
+    recent_requests: Mutex<Vec<IncomingRequest>>,
+    recent_responses: Mutex<Vec<ModelResponse>>,
 }
 
 impl AppState {
@@ -67,6 +88,8 @@ impl AppState {
             responses: Mutex::new(HashMap::new()),
             response_waiters: Mutex::new(HashMap::new()),
             broadcast_tx: tx,
+            recent_requests: Mutex::new(Vec::new()),
+            recent_responses: Mutex::new(Vec::new()),
         }
     }
 }
@@ -91,6 +114,8 @@ async fn wizard_ui() -> impl IntoResponse {
         .btn-primary { background: #28a745; color: white; }
         .btn-secondary { background: #6c757d; color: white; }
         .btn-warning { background: #ffc107; color: #212529; }
+        .btn-info { background: #17a2b8; color: white; }
+        .btn-success { background: #007bff; color: white; }
         .btn:hover { opacity: 0.9; }
         textarea { width: 100%; min-height: 100px; padding: 10px; border: 1px solid #dee2e6; border-radius: 4px; font-family: monospace; }
         .log { background: #f8f9fa; border: 1px solid #dee2e6; padding: 15px; border-radius: 4px; max-height: 300px; overflow-y: auto; font-family: monospace; font-size: 12px; }
@@ -104,6 +129,21 @@ async fn wizard_ui() -> impl IntoResponse {
         .response-card .wizard-input { background: #f0f0f0; padding: 10px; border-radius: 4px; margin-bottom: 10px; font-family: monospace; font-size: 12px; }
         .response-card .model-output { background: white; padding: 10px; border-radius: 4px; border: 1px solid #dee2e6; }
         .completed-tool { opacity: 0.7; pointer-events: none; }
+        .request-card { background: #f0f8ff; padding: 12px; border-radius: 6px; margin-bottom: 10px; border-left: 3px solid #4a90e2; }
+        .request-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+        .request-message { color: #333; font-size: 13px; margin-bottom: 6px; }
+        .request-meta { color: #666; font-size: 11px; }
+        .response-log-card { background: #fff3cd; padding: 12px; border-radius: 6px; margin-bottom: 10px; border-left: 3px solid #ffc107; }
+        .response-log-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+        .response-log-reason { color: #856404; font-size: 11px; margin-bottom: 6px; font-weight: bold; }
+        .response-log-content { color: #333; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+        .delegation-card { background: #e7f3ff; padding: 12px; border-radius: 6px; margin-bottom: 10px; border-left: 3px solid #2196F3; }
+        .delegation-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+        .delegation-args { color: #333; font-size: 11px; margin-bottom: 6px; font-family: monospace; white-space: pre-wrap; }
+        .delegation-action { color: #1976d2; font-size: 11px; font-style: italic; }
+        .tool-call-card { background: #fff3cd; padding: 12px; border-radius: 6px; margin-bottom: 10px; border-left: 3px solid #ffc107; }
+        .tool-call-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+        .tool-call-status { color: #856404; font-size: 11px; margin-top: 8px; font-style: italic; }
     </style>
 </head>
 <body>
@@ -112,18 +152,69 @@ async fn wizard_ui() -> impl IntoResponse {
         <div class="status">Connected • <span id="session-count">0</span> active sessions</div>
     </div>
 
-    <div id="pending"></div>
-
     <div style="margin-top: 30px;">
-        <h2>📝 Model Responses</h2>
-        <div id="responses" style="margin-top: 15px;"></div>
+        <h2>
+            ⏱️ Event Stream
+            <button onclick="toggleEventOrder()" style="margin-left: 15px; padding: 5px 10px; font-size: 12px; cursor: pointer;">
+                Order: <span id="order-label">Newest first</span> ⬍
+            </button>
+        </h2>
+        <div id="events" style="margin-top: 15px;"></div>
     </div>
+
+    <div id="pending"></div>
 
     <div class="log" id="log"></div>
 
     <script>
         let ws;
         let currentCall = null;
+        let newestFirst = true;  // Track event order
+
+        function toggleEventOrder() {
+            newestFirst = !newestFirst;
+            document.getElementById('order-label').textContent = newestFirst ? 'Newest first' : 'Oldest first';
+            reorderEvents();
+            addLog(`Event order changed to: ${newestFirst ? 'newest first' : 'oldest first'}`, 'info');
+        }
+
+        function reorderEvents() {
+            const eventsDiv = document.getElementById('events');
+            const events = Array.from(eventsDiv.children);
+            const sorted = events.sort((a, b) => {
+                const timeA = new Date(a.querySelector('.timestamp')?.textContent || '0').getTime();
+                const timeB = new Date(b.querySelector('.timestamp')?.textContent || '0').getTime();
+                return newestFirst ? timeB - timeA : timeA - timeB;
+            });
+            sorted.forEach(card => eventsDiv.appendChild(card));
+        }
+
+        function addToEventStream(card) {
+            const eventsDiv = document.getElementById('events');
+
+            // Insert in timestamp order (oldest first)
+            const cardTime = new Date(card.querySelector('.timestamp')?.textContent || 0).getTime();
+            const children = Array.from(eventsDiv.children);
+
+            let inserted = false;
+            for (let i = 0; i < children.length; i++) {
+                const childTime = new Date(children[i].querySelector('.timestamp')?.textContent || 0).getTime();
+                if (cardTime < childTime) {
+                    eventsDiv.insertBefore(card, children[i]);
+                    inserted = true;
+                    break;
+                }
+            }
+
+            if (!inserted) {
+                eventsDiv.appendChild(card);
+            }
+
+            // Reorder if needed
+            if (newestFirst) {
+                reorderEvents();
+            }
+        }
 
         function connect() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -152,11 +243,38 @@ async fn wizard_ui() -> impl IntoResponse {
                 addLog(data.message, data.level || 'info');
             } else if (data.type === 'status') {
                 updateStatus(data);
+            } else if (data.type === 'incoming_request') {
+                addIncomingRequest(data.data);
+            } else if (data.type === 'model_response') {
+                addModelResponseLog(data.data);
+            } else if (data.type === 'delegation') {
+                addDelegationEvent(data.data);
+            } else if (data.type === 'tool_call_completed') {
+                // Update the event stream card and clear from pending
+                const eventCard = document.getElementById(`event-call-${data.tool_name}`);
+                if (eventCard) {
+                    const statusDiv = eventCard.querySelector('.tool-call-status');
+                    if (statusDiv) {
+                        statusDiv.textContent = '✓ Completed';
+                        statusDiv.style.color = '#28a745';
+                        statusDiv.style.fontWeight = 'bold';
+                    }
+                }
+
+                // Also clear from pending section
+                const pendingDiv = document.getElementById('pending');
+                const toolCards = pendingDiv.querySelectorAll('.tool-call');
+                toolCards.forEach(card => {
+                    const title = card.querySelector('h3');
+                    if (title && title.textContent.includes(data.tool_name)) {
+                        clearPendingCall(card.id.replace('call-', ''));
+                    }
+                });
             }
         }
 
         function addModelResponse(callId, wizardInput, modelOutput) {
-            const responsesDiv = document.getElementById('responses');
+            const eventsDiv = document.getElementById('events');
             const card = document.createElement('div');
             card.className = 'response-card';
             card.id = `response-${callId}`;
@@ -171,10 +289,29 @@ async fn wizard_ui() -> impl IntoResponse {
                     ${modelOutput || 'Waiting for model response...'}
                 </div>
             `;
-            responsesDiv.insertBefore(card, responsesDiv.firstChild);
+            eventsDiv.insertBefore(card, eventsDiv.firstChild);
         }
 
         function addPendingCall(call) {
+            const timestamp = new Date().toLocaleTimeString();
+
+            // Add to event stream (chronological)
+            const card = document.createElement('div');
+            card.className = 'tool-call-card';
+            card.id = `event-call-${call.call_id}`;
+            card.innerHTML = `
+                <div class="tool-call-header">
+                    <strong>🔧 Tool Call: ${call.name}</strong>
+                    <span class="timestamp">${timestamp}</span>
+                </div>
+                <div><strong>ID:</strong> <code>${call.call_id}</code></div>
+                <div><strong>Arguments:</strong></div>
+                <pre>${JSON.stringify(call.arguments, null, 2)}</pre>
+                <div class="tool-call-status">⏳ Waiting for wizard response...</div>
+            `;
+            addToEventStream(card);
+
+            // Also add to pending section for interaction
             const pendingDiv = document.getElementById('pending');
             const callDiv = document.createElement('div');
             callDiv.className = 'tool-call';
@@ -189,6 +326,7 @@ async fn wizard_ui() -> impl IntoResponse {
                     <button class="btn btn-secondary" onclick="respondForward('${call.call_id}')">📝 Add Context & Forward to AI</button>
                     <button class="btn btn-info" onclick="respondSkip('${call.call_id}')">⚡ Skip AI (Testing)</button>
                     <button class="btn btn-warning" onclick="respondModel('${call.call_id}')">🤖 Let AI Answer</button>
+                    <button class="btn btn-success" onclick="respondDelegate('${call.call_id}')">🔄 Delegate to Agent</button>
                 </div>
                 <div id="response-${call.call_id}" style="display:none; margin-top:15px;">
                     <label><strong>Your Response:</strong></label>
@@ -198,11 +336,13 @@ async fn wizard_ui() -> impl IntoResponse {
                         • <strong>Answer as Tool:</strong> Provide tool result, AI integrates into final answer<br>
                         • <strong>Add Context:</strong> Add info to conversation, AI continues<br>
                         • <strong>Skip AI:</strong> ⚠️ Currently doesn't work - AI still processes (engine limitation)<br>
-                        • <strong>Let AI Answer:</strong> AI handles tool call itself
+                        • <strong>Let AI Answer:</strong> AI handles tool call itself<br>
+                        • <strong>Delegate to Agent:</strong> Forward to original agent (Goose, etc.) to execute
                     </div>
                     <div class="actions" style="margin-top:10px;">
                         <button class="btn btn-primary" onclick="sendResponse('${call.call_id}')">Send Response</button>
                         <button class="btn btn-secondary" onclick="cancelResponse('${call.call_id}')">Cancel</button>
+                        <button class="btn btn-success" onclick="respondDelegate('${call.call_id}')" style="display:none;" id="delegate-btn-${call.call_id}">Delegate to Agent</button>
                     </div>
                 </div>
                 <div id="submitted-${call.call_id}" style="display:none; margin-top:15px; background:#d4edda; padding:10px; border-radius:4px;">
@@ -220,6 +360,80 @@ async fn wizard_ui() -> impl IntoResponse {
                 setTimeout(() => callDiv.remove(), 2000);
             }
         }
+
+        function addIncomingRequest(request) {
+            const card = document.createElement('div');
+            card.className = 'request-card';
+            card.id = `req-${request.id}`;
+            card.innerHTML = `
+                <div class="request-header">
+                    <strong>📨 Request: ${request.model}</strong>
+                    <span class="timestamp">${new Date(request.timestamp).toLocaleTimeString()}</span>
+                </div>
+                <div class="request-message">${request.user_message.substring(0, 200)}${request.user_message.length > 200 ? '...' : ''}</div>
+                <div class="request-meta">
+                    Tools: ${request.tool_count || 0} | ID: ${request.id.substring(0, 8)}
+                </div>
+            `;
+            addToEventStream(card);
+
+            const eventsDiv = document.getElementById('events');
+            // Keep only last 50 events visible
+            while (eventsDiv.children.length > 50) {
+                eventsDiv.removeChild(eventsDiv.lastChild);
+            }
+
+            addLog(`New request from ${request.model}: ${request.user_message.substring(0, 50)}...`, 'info');
+        }
+
+        function addModelResponseLog(response) {
+            const card = document.createElement('div');
+            card.className = 'response-log-card';
+            card.id = `resp-${response.id}`;
+            card.innerHTML = `
+                <div class="response-log-header">
+                    <strong>📤 Response: ${response.model}</strong>
+                    <span class="timestamp">${new Date(response.timestamp).toLocaleTimeString()}</span>
+                </div>
+                <div class="response-log-reason">Finish: ${response.finish_reason}</div>
+                <div class="response-log-content">${response.content.substring(0, 300)}${response.content.length > 300 ? '...' : ''}</div>
+            `;
+            addToEventStream(card);
+
+            const eventsDiv = document.getElementById('events');
+            // Keep only last 50 events visible
+            while (eventsDiv.children.length > 50) {
+                eventsDiv.removeChild(eventsDiv.lastChild);
+            }
+
+            const contentPreview = response.content.substring(0, 50);
+            addLog(`Model response to ${response.model}: ${contentPreview}... (${response.finish_reason})`, 'success');
+        }
+
+        function addDelegationEvent(delegation) {
+            const card = document.createElement('div');
+            card.className = 'delegation-card';
+            card.id = `delegation-${delegation.id}`;
+            card.innerHTML = `
+                <div class="delegation-header">
+                    <strong>🔄 Delegated: ${delegation.tool_name}</strong>
+                    <span class="timestamp">${new Date(delegation.timestamp).toLocaleTimeString()}</span>
+                </div>
+                <div class="delegation-args"><strong>Sent to agent:</strong><br>
+${delegation.tool_args.substring(0, 300)}${delegation.tool_args.length > 300 ? '...' : ''}</div>
+                <div class="delegation-action">→ Agent should execute tool and send back result</div>
+            `;
+            addToEventStream(card);
+
+            const eventsDiv = document.getElementById('events');
+            // Keep only last 50 events visible
+            while (eventsDiv.children.length > 50) {
+                eventsDiv.removeChild(eventsDiv.lastChild);
+            }
+
+            addLog(`Delegated ${delegation.tool_name} to agent (returned tool_calls in response)`, 'info');
+        }
+
 
         function respondDirect(callId) {
             document.getElementById(`response-${callId}`).style.display = 'block';
@@ -255,6 +469,13 @@ async fn wizard_ui() -> impl IntoResponse {
             sendResponse(callId, JSON.stringify(errorResp), false);
         }
 
+        function respondDelegate(callId) {
+            const textarea = document.getElementById(`textarea-${callId}`);
+            const editedArgs = textarea.value.trim();
+            sendResponse(callId, editedArgs || null, 'delegate');
+        }
+
+
         function sendResponse(callId, customResponse, mode) {
             let result;
             let useModel = false;
@@ -271,6 +492,14 @@ async fn wizard_ui() -> impl IntoResponse {
             } else if (finalMode === 'skip_ai') {
                 result = textValue || customResponse || JSON.stringify({ error: "No response provided" });
                 skipAi = true;
+            } else if (finalMode === 'delegate') {
+                // Delegate to agent: optionally edit args, then forward
+                const editedArgs = textValue || customResponse;
+                if (editedArgs) {
+                    result = `__DELEGATE__:${editedArgs}`;
+                } else {
+                    result = "__DELEGATE__";
+                }
             } else if (textValue || customResponse) {
                 result = textValue || customResponse;
             } else {
@@ -329,9 +558,11 @@ async fn wizard_ui() -> impl IntoResponse {
 /// GET /status - Current status for wizards
 async fn get_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let calls = state.pending_calls.lock().unwrap();
+    let reqs = state.recent_requests.lock().unwrap();
     Json(WizardStatus {
         pending_calls: calls.clone(),
         active_sessions: 1,
+        recent_requests: reqs.clone(),
     })
 }
 
@@ -641,6 +872,170 @@ async fn poll_response(
     }
 }
 
+/// POST /log_request - Log an incoming request from the main server
+async fn log_request(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let id = uuid::Uuid::new_v4().to_string();
+    let model = request.get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let user_message = request.get("user_message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let tool_count = request.get("tool_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+
+    let timestamp = chrono::Utc::now().to_rfc3339();
+
+    let incoming_request = IncomingRequest {
+        id: id.clone(),
+        model,
+        user_message,
+        tool_count,
+        timestamp,
+    };
+
+    // Add to recent requests (keep last 50)
+    {
+        let mut reqs = state.recent_requests.lock().unwrap();
+        reqs.push(incoming_request.clone());
+        if reqs.len() > 50 {
+            reqs.remove(0);
+        }
+    }
+
+    // Broadcast to WebSocket clients
+    if let Ok(msg) = serde_json::to_string(&serde_json::json!({
+        "type": "incoming_request",
+        "data": incoming_request
+    })) {
+        let _ = state.broadcast_tx.send(msg);
+    }
+
+    info!("WOZ: Logged incoming request {} (model: {}, tools: {})", id, request.get("model").and_then(|v| v.as_str()).unwrap_or("unknown"), tool_count);
+
+    (axum::http::StatusCode::OK, Json(serde_json::json!({ "id": id })))
+}
+
+/// POST /log_response - Log a model response back to the client
+async fn log_response(
+    State(state): State<Arc<AppState>>,
+    Json(response): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let id = uuid::Uuid::new_v4().to_string();
+    let model = response.get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let content = response.get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let finish_reason = response.get("finish_reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let timestamp = chrono::Utc::now().to_rfc3339();
+
+    let model_response = ModelResponse {
+        id: id.clone(),
+        model,
+        content,
+        finish_reason,
+        timestamp,
+    };
+
+    // Add to recent responses (keep last 50)
+    {
+        let mut resps = state.recent_responses.lock().unwrap();
+        resps.push(model_response.clone());
+        if resps.len() > 50 {
+            resps.remove(0);
+        }
+    }
+
+    // Broadcast to WebSocket clients
+    if let Ok(msg) = serde_json::to_string(&serde_json::json!({
+        "type": "model_response",
+        "data": model_response
+    })) {
+        let _ = state.broadcast_tx.send(msg);
+    }
+
+    let content_preview = if model_response.content.len() > 100 {
+        format!("{}...", &model_response.content[..100])
+    } else {
+        model_response.content.clone()
+    };
+    info!("WOZ: Logged model response {} (model: {}, reason: {}, content: {})",
+        id, model_response.model, model_response.finish_reason, content_preview);
+
+    (axum::http::StatusCode::OK, Json(serde_json::json!({ "id": id })))
+}
+
+/// POST /log_delegation - Log a tool delegation event
+async fn log_delegation(
+    State(state): State<Arc<AppState>>,
+    Json(delegation): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let id = uuid::Uuid::new_v4().to_string();
+    let tool_name = delegation.get("tool_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let tool_args = delegation.get("tool_args")
+        .and_then(|v| v.as_str())
+        .unwrap_or("{}")
+        .to_string();
+
+    let action = delegation.get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("delegated_to_client")
+        .to_string();
+
+    let timestamp = chrono::Utc::now().to_rfc3339();
+
+    // Broadcast delegation event to WebSocket clients
+    if let Ok(msg) = serde_json::to_string(&serde_json::json!({
+        "type": "delegation",
+        "data": {
+            "id": id,
+            "tool_name": tool_name.clone(),
+            "tool_args": tool_args,
+            "action": action,
+            "timestamp": timestamp
+        }
+    })) {
+        let _ = state.broadcast_tx.send(msg);
+    }
+
+    // Broadcast tool call completion to remove it from pending section
+    if let Ok(msg) = serde_json::to_string(&serde_json::json!({
+        "type": "tool_call_completed",
+        "tool_name": tool_name,
+        "timestamp": timestamp
+    })) {
+        let _ = state.broadcast_tx.send(msg);
+    }
+
+    info!("WOZ: Logged delegation {} - tool {} ({})", id, tool_name, action);
+
+    (axum::http::StatusCode::OK, Json(serde_json::json!({ "id": id })))
+}
+
+
+
 /// Create router
 pub fn create_wizard_router() -> Router {
     let state = Arc::new(AppState::new());
@@ -652,6 +1047,9 @@ pub fn create_wizard_router() -> Router {
         .route("/dispatch", post(dispatch_tool))
         .route("/respond", post(respond_to_call))
         .route("/poll/{call_id}", get(poll_response))
+        .route("/log_request", post(log_request))
+        .route("/log_response", post(log_response))
+        .route("/log_delegation", post(log_delegation))
         .route("/ws", get(wizard_websocket))
         .with_state(state)
 }
