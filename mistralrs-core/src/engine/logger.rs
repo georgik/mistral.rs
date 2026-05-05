@@ -16,6 +16,8 @@ pub struct IntervalLogger {
     num_waiting: Arc<AtomicUsize>,
     encoder_cache_hits: Option<Arc<AtomicUsize>>,
     encoder_cache_misses: Option<Arc<AtomicUsize>>,
+    current_context_tokens: Arc<AtomicUsize>,
+    max_context_tokens: Arc<AtomicUsize>,
 }
 
 impl IntervalLogger {
@@ -30,6 +32,8 @@ impl IntervalLogger {
         let enable_logging = Arc::new(AtomicBool::new(false));
         let num_running = Arc::new(AtomicUsize::new(0));
         let num_waiting = Arc::new(AtomicUsize::new(0));
+        let current_context_tokens = Arc::new(AtomicUsize::new(0));
+        let max_context_tokens = Arc::new(AtomicUsize::new(0));
 
         let t_prefix_cache_hits = prefix_cache_hits.clone();
         let t_tokens_processed = tokens_processed.clone();
@@ -37,6 +41,8 @@ impl IntervalLogger {
         let t_enable_logging = enable_logging.clone();
         let t_num_running = num_running.clone();
         let t_num_waiting = num_waiting.clone();
+        let t_current_context_tokens = current_context_tokens.clone();
+        let t_max_context_tokens = max_context_tokens.clone();
         let (encoder_cache_hits, encoder_cache_misses) = match encoder_cache_counters {
             Some((h, m)) => (Some(h), Some(m)),
             None => (None, None),
@@ -56,8 +62,20 @@ impl IntervalLogger {
                 let tokens_processed = t_tokens_processed.swap(0, Ordering::Relaxed);
                 let num_running = t_num_running.load(Ordering::Relaxed);
                 let num_waiting = t_num_waiting.load(Ordering::Relaxed);
+                let current_ctx = t_current_context_tokens.load(Ordering::Relaxed);
+                let max_ctx = t_max_context_tokens.load(Ordering::Relaxed);
 
                 if total_new_seqs != 0 && tokens_processed != 0 {
+                    let ctx_info = if max_ctx > 0 {
+                        let pct = 100.0 * current_ctx as f64 / max_ctx as f64;
+                        let remaining = max_ctx.saturating_sub(current_ctx);
+                        format!(
+                            ", Context: {}/{} ({}% used, {} remaining)",
+                            current_ctx, max_ctx, pct as u32, remaining
+                        )
+                    } else {
+                        String::new()
+                    };
                     let enc_cache_info =
                         if let (Some(ref hits), Some(ref misses)) = (&t_enc_hits, &t_enc_misses) {
                             let h = hits.load(Ordering::Relaxed);
@@ -80,7 +98,7 @@ impl IntervalLogger {
                     // swapped to 0 each interval, so the metric reflects only the current
                     // window and is not cumulative.
                     info!(
-                        "Throughput (T/s) {:.2}, Prefix cache hitrate {:.2}%{enc_cache_info}, {num_running} running, {num_waiting} waiting",
+                        "Throughput (T/s) {:.2}, Prefix cache hitrate {:.2}%{enc_cache_info}{ctx_info}, {num_running} running, {num_waiting} waiting",
                         tokens_processed as f64 / interval.as_secs_f64(),
                         100. * prefix_cache_hits as f64 / total_new_seqs as f64,
                     );
@@ -97,6 +115,8 @@ impl IntervalLogger {
             num_waiting,
             encoder_cache_hits,
             encoder_cache_misses,
+            current_context_tokens,
+            max_context_tokens,
         }
     }
 
@@ -154,5 +174,11 @@ impl IntervalLogger {
             (Some(h), Some(m)) => Some((h.load(Ordering::Relaxed), m.load(Ordering::Relaxed))),
             _ => None,
         }
+    }
+
+    /// Update current context token usage and max capacity.
+    pub fn set_context_usage(&self, current: usize, max: usize) {
+        self.current_context_tokens.store(current, Ordering::Relaxed);
+        self.max_context_tokens.store(max, Ordering::Relaxed);
     }
 }

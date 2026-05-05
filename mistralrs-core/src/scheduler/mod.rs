@@ -52,7 +52,7 @@ pub enum SchedulerOutput<'a> {
 }
 
 pub trait Scheduler: Send + Sync {
-    fn schedule(&mut self, logger: &IntervalLogger) -> SchedulerOutput<'_>;
+    fn schedule(&mut self, logger: &IntervalLogger, max_seq_len: usize) -> SchedulerOutput<'_>;
     fn waiting_len(&self) -> usize;
     fn running_len(&self) -> usize;
     fn add_seq(&mut self, seq: Sequence);

@@ -176,7 +176,7 @@ impl PagedAttentionScheduler {
         selected
     }
 
-    pub fn schedule(&mut self, logger: &IntervalLogger) -> PagedAttentionSchedulerOutput {
+    pub fn schedule(&mut self, logger: &IntervalLogger, max_seq_len: usize) -> PagedAttentionSchedulerOutput {
         let mut scheduled: VecDeque<Arc<Mutex<Sequence>>> = VecDeque::new();
         let mut for_waiting_again: VecDeque<Arc<Mutex<Sequence>>> = VecDeque::new();
         while !self.waiting.is_empty() {
@@ -319,6 +319,12 @@ impl PagedAttentionScheduler {
                 .map(|seq| get_mut_arcmutex!(seq).prefix_cache_len())
                 .collect();
 
+            // Update context usage
+            let current_tokens: usize = self.running.iter()
+                .map(|seq| get_mut_arcmutex!(seq).len())
+                .sum();
+            let actual_usage = current_tokens.saturating_mul(2); // KV cache overhead
+            logger.set_context_usage(actual_usage, max_seq_len);
             logger.set_num_running(self.running.len());
             logger.set_num_waiting(self.waiting.len());
 
@@ -414,6 +420,12 @@ impl PagedAttentionScheduler {
             }
         }
 
+        // Update context usage
+        let current_tokens: usize = self.running.iter()
+            .map(|seq| get_mut_arcmutex!(seq).len())
+            .sum();
+        let actual_usage = current_tokens.saturating_mul(2); // KV cache overhead
+        logger.set_context_usage(actual_usage, max_seq_len);
         logger.set_num_running(self.running.len());
         logger.set_num_waiting(self.waiting.len());
 
@@ -505,9 +517,9 @@ impl Scheduler for PagedAttentionScheduler {
     fn add_seq(&mut self, seq: Sequence) {
         self.waiting.push_back(Arc::new(Mutex::new(seq)));
     }
-    fn schedule(&mut self, logger: &IntervalLogger) -> SchedulerOutput<'_> {
+    fn schedule(&mut self, logger: &IntervalLogger, max_seq_len: usize) -> SchedulerOutput<'_> {
         SchedulerOutput::PagedAttention {
-            output: self.schedule(logger),
+            output: self.schedule(logger, max_seq_len),
         }
     }
     fn waiting_len(&self) -> usize {

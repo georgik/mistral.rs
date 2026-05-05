@@ -203,7 +203,7 @@ impl<Backer: FcfsBacker> DefaultScheduler<Backer> {
     }
 
     /// Schedule all sequences based on their state and the available space.
-    pub fn schedule(&mut self, logger: &IntervalLogger) -> DefaultSchedulerOutput<'_> {
+    pub fn schedule(&mut self, logger: &IntervalLogger, max_seq_len: usize) -> DefaultSchedulerOutput<'_> {
         // Filter out all done sequences
         let running = std::mem::take(&mut self.running);
         let mut waiting = std::mem::take(&mut self.waiting);
@@ -212,10 +212,19 @@ impl<Backer: FcfsBacker> DefaultScheduler<Backer> {
             .filter(|seq| seq.is_running())
             .collect::<Vec<_>>();
 
+        // Helper to update logger with context usage
+        let update_logger = |running: &[Sequence], logger: &IntervalLogger| {
+            let current_tokens: usize = running.iter().map(|seq| seq.len()).sum();
+            // Account for KV cache overhead (approximately 2x for keys+values)
+            let actual_usage = current_tokens.saturating_mul(2);
+            logger.set_context_usage(actual_usage, max_seq_len);
+            logger.set_num_running(running.len());
+        };
+
         match (waiting.len(), running.len()) {
             (0, 0) => {
                 self.running = running;
-                logger.set_num_running(self.running.len());
+                update_logger(&self.running, logger);
                 logger.set_num_waiting(self.waiting.len());
                 return DefaultSchedulerOutput {
                     prompt: vec![].into(),
@@ -230,7 +239,7 @@ impl<Backer: FcfsBacker> DefaultScheduler<Backer> {
                 self.waiting = Backer::new();
                 let running = std::mem::take(&mut self.running);
                 self.running = self.bucket_and_waitlist_seqs(running);
-                logger.set_num_running(self.running.len());
+                update_logger(&self.running, logger);
                 logger.set_num_waiting(self.waiting.len());
                 return DefaultSchedulerOutput {
                     prompt: self.running.iter_mut().collect::<Vec<_>>().into(),
@@ -245,7 +254,7 @@ impl<Backer: FcfsBacker> DefaultScheduler<Backer> {
                         .for_each(|seq| seq.set_state(SequenceState::Done(StopReason::Canceled)));
                     TERMINATE_ALL_NEXT_STEP.store(false, Ordering::SeqCst);
                 }
-                logger.set_num_running(self.running.len());
+                update_logger(&self.running, logger);
                 logger.set_num_waiting(self.waiting.len());
                 return DefaultSchedulerOutput {
                     prompt: vec![].into(),
@@ -281,7 +290,7 @@ impl<Backer: FcfsBacker> DefaultScheduler<Backer> {
         self.running = running;
         self.waiting = new_waiting;
 
-        logger.set_num_running(self.running.len());
+        update_logger(&self.running, logger);
         logger.set_num_waiting(self.waiting.len());
 
         let mut completion = Vec::new();
@@ -308,9 +317,9 @@ impl<Backer: FcfsBacker> DefaultScheduler<Backer> {
 }
 
 impl Scheduler for DefaultScheduler<VecDeque<Sequence>> {
-    fn schedule(&mut self, logger: &IntervalLogger) -> SchedulerOutput<'_> {
+    fn schedule(&mut self, logger: &IntervalLogger, max_seq_len: usize) -> SchedulerOutput<'_> {
         SchedulerOutput::DefaultScheduler {
-            output: self.schedule(logger),
+            output: self.schedule(logger, max_seq_len),
         }
     }
     fn waiting_len(&self) -> usize {
