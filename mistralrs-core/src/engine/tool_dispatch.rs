@@ -308,6 +308,10 @@ pub(super) fn execute_custom_tool(engine: &Engine, tc: &ToolCallResponse) -> Too
 ///
 /// Sends `{"name": "...", "arguments": {...}}` and expects
 /// `{"content": "..."}` back.
+///
+/// Special response modes:
+/// - `{"content": "...", "complete": true}` - Final answer, stop tool loop
+/// - `{"content": "...", "complete": false}` - Continue tool loop (default)
 pub(super) fn execute_http_tool(tc: &ToolCallResponse, url: &str) -> ToolResult {
     let name = &tc.function.name;
     let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)
@@ -316,30 +320,40 @@ pub(super) fn execute_http_tool(tc: &ToolCallResponse, url: &str) -> ToolResult 
 
     // Must use block_in_place because reqwest::blocking creates its own
     // tokio runtime, which panics if called from an async context.
-    let content = tokio::task::block_in_place(|| match _http_post(url, &payload) {
+    let (content, complete) = tokio::task::block_in_place(|| match _http_post(url, &payload) {
         Ok(body) => {
-            // Accept either {"content": "..."} or a bare string.
+            // Accept either {"content": "...", "complete": bool} or {"content": "..."} or bare string
             if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&body) {
-                obj.get("content")
+                let content = obj.get("content")
                     .and_then(|v| v.as_str())
                     .unwrap_or(&body)
-                    .to_string()
+                    .to_string();
+                let complete = obj.get("complete")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                (content, complete)
             } else {
-                body
+                (body, false)
             }
         }
         Err(e) => {
             tracing::error!("HTTP tool callback for `{name}` failed: {e}");
-            serde_json::json!({
+            (serde_json::json!({
                 "error": format!("{e}"),
                 "tool": name,
                 "status": "failed"
             })
-            .to_string()
+            .to_string(), false)
         }
     });
 
-    ToolResult { content }
+    if complete {
+        tracing::info!("HTTP tool `{}` returned complete response, stopping tool loop", name);
+        // Return content with special marker to signal completion
+        ToolResult { content: format!("__COMPLETE__: {}", content) }
+    } else {
+        ToolResult { content }
+    }
 }
 
 fn _http_post(url: &str, payload: &serde_json::Value) -> anyhow::Result<String> {
